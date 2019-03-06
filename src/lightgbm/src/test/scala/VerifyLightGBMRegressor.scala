@@ -4,6 +4,7 @@
 package com.microsoft.ml.spark
 
 import org.apache.spark.ml.evaluation.RegressionEvaluator
+import org.apache.spark.ml.feature.StringIndexer
 import org.apache.spark.ml.tuning.{CrossValidator, ParamGridBuilder, TrainValidationSplit}
 import org.apache.spark.ml.util.MLReadable
 import org.apache.spark.ml.linalg.Vector
@@ -15,6 +16,7 @@ class VerifyLightGBMRegressor extends Benchmarks with EstimatorFuzzing[LightGBMR
   lazy val moduleName = "lightgbm"
   var portIndex = 0
   val numPartitions = 2
+  val boostingTypes = Array("gbdt", "rf", "dart", "goss")
 
   verifyLearnerOnRegressionCsvFile("energyefficiency2012_data.train.csv", "Y1", 0,
     Some("X1,X2,X3,X4,X5,X6,X7,X8,Y1,Y2"))
@@ -96,6 +98,48 @@ class VerifyLightGBMRegressor extends Benchmarks with EstimatorFuzzing[LightGBMR
     assert(avglabelWeight < avglabelNoWeight)
   }
 
+  test("Verify LightGBM Regressor categorical parameter") {
+    // Increment port index
+    portIndex += numPartitions
+    val fileName = "flare.data1.train.csv"
+    val categoricalColumns = Array("Zurich class", "largest spot size", "spot distribution")
+    val newCategoricalColumns = categoricalColumns.map("c_" + _)
+    val labelColumnName = "M-class flares production by this region"
+    val fileLocation = DatasetUtils.regressionTrainFile(fileName).toString
+    val readDataset = readCSV(fileName, fileLocation).repartition(numPartitions)
+    val mca = new MultiColumnAdapter().setInputCols(categoricalColumns).setOutputCols(newCategoricalColumns)
+      .setBaseStage(new StringIndexer())
+    val mcaModel = mca.fit(readDataset)
+    val categoricalDataset = mcaModel.transform(readDataset).drop(categoricalColumns: _*)
+    val seed = 42
+    val data = categoricalDataset.randomSplit(Array(0.8, 0.2), seed.toLong)
+    val trainData = data(0)
+    val testData = data(1)
+
+    val featuresColumn = "_features"
+    val predCol = "prediction"
+    val lgbm = new LightGBMRegressor()
+      .setCategoricalSlotNames(newCategoricalColumns)
+      .setLabelCol(labelColumnName)
+      .setFeaturesCol(featuresColumn)
+      .setDefaultListenPort(LightGBMConstants.defaultLocalListenPort + portIndex)
+      .setNumLeaves(5)
+      .setNumIterations(10)
+      .setPredictionCol(predCol)
+
+    val featurizer = LightGBMUtils.featurizeData(trainData, labelColumnName, featuresColumn)
+    val transformedData = featurizer.transform(trainData)
+    val scoredData = featurizer.transform(testData)
+    val eval = new RegressionEvaluator()
+      .setLabelCol(labelColumnName)
+      .setPredictionCol(predCol)
+      .setMetricName("rmse")
+    val metric = eval.evaluate(
+      lgbm.fit(transformedData).transform(scoredData))
+    // Verify we get good result
+    assert(metric < 0.6)
+  }
+
   test("Verify LightGBM Regressor with tweedie distribution") {
     // Increment port index
     portIndex += numPartitions
@@ -149,41 +193,50 @@ class VerifyLightGBMRegressor extends Benchmarks with EstimatorFuzzing[LightGBMR
                                        labelCol: String,
                                        decimals: Int,
                                        columnsFilter: Option[String] = None): Unit = {
-    test("Verify LightGBMRegressor can be trained and scored on " + fileName, TestBase.Extended) {
-      // Increment port index
-      portIndex += numPartitions
-      val fileLocation = DatasetUtils.regressionTrainFile(fileName).toString
-      val readDataset = readCSV(fileName, fileLocation).repartition(numPartitions)
-      val dataset =
-        if (columnsFilter.isDefined) {
-          readDataset.select(columnsFilter.get.split(",").map(new Column(_)): _*)
-        } else {
-          readDataset
+    boostingTypes.foreach { boostingType =>
+      val boostingText = " with boosting type " + boostingType
+      val testText = "Verify LightGBMRegressor can be trained and scored on "
+      test(testText + fileName + boostingText, TestBase.Extended) {
+        // Increment port index
+        portIndex += numPartitions
+        val fileLocation = DatasetUtils.regressionTrainFile(fileName).toString
+        val readDataset = readCSV(fileName, fileLocation).repartition(numPartitions)
+        val dataset =
+          if (columnsFilter.isDefined) {
+            readDataset.select(columnsFilter.get.split(",").map(new Column(_)): _*)
+          } else {
+            readDataset
+          }
+        val lgbm = new LightGBMRegressor()
+        val featuresColumn = lgbm.uid + "_features"
+        val featurizer = LightGBMUtils.featurizeData(dataset, labelCol, featuresColumn)
+        val predCol = "pred"
+        val trainData = featurizer.transform(dataset)
+        if (boostingType == "rf") {
+          lgbm.setBaggingFraction(0.9)
+          lgbm.setBaggingFreq(1)
         }
-      val lgbm = new LightGBMRegressor()
-      val featuresColumn = lgbm.uid + "_features"
-      val featurizer = LightGBMUtils.featurizeData(dataset, labelCol, featuresColumn)
-      val predCol = "pred"
-      val trainData = featurizer.transform(dataset)
-      val model = lgbm.setLabelCol(labelCol)
-        .setFeaturesCol(featuresColumn)
-        .setDefaultListenPort(LightGBMConstants.defaultLocalListenPort + portIndex)
-        .setNumLeaves(5)
-        .setNumIterations(10)
-        .setPredictionCol(predCol)
-        .fit(trainData)
-      val scoredResult = model.transform(trainData).drop(featuresColumn)
-      val splitFeatureImportances = model.getFeatureImportances("split")
-      val gainFeatureImportances = model.getFeatureImportances("gain")
-      val featuresLength = trainData.select(featuresColumn).first().getAs[Vector](featuresColumn).size
-      assert(splitFeatureImportances.length == gainFeatureImportances.length)
-      assert(featuresLength == splitFeatureImportances.length)
-      val eval = new RegressionEvaluator()
-        .setLabelCol(labelCol)
-        .setPredictionCol(predCol)
-        .setMetricName("rmse")
-      val metric = eval.evaluate(scoredResult)
-      addBenchmark(s"LightGBMRegressor_$fileName", metric, decimals, false)
+        val model = lgbm.setLabelCol(labelCol)
+          .setFeaturesCol(featuresColumn)
+          .setDefaultListenPort(LightGBMConstants.defaultLocalListenPort + portIndex)
+          .setNumLeaves(5)
+          .setNumIterations(10)
+          .setPredictionCol(predCol)
+          .setBoostingType(boostingType)
+          .fit(trainData)
+        val scoredResult = model.transform(trainData).drop(featuresColumn)
+        val splitFeatureImportances = model.getFeatureImportances("split")
+        val gainFeatureImportances = model.getFeatureImportances("gain")
+        val featuresLength = trainData.select(featuresColumn).first().getAs[Vector](featuresColumn).size
+        assert(splitFeatureImportances.length == gainFeatureImportances.length)
+        assert(featuresLength == splitFeatureImportances.length)
+        val eval = new RegressionEvaluator()
+          .setLabelCol(labelCol)
+          .setPredictionCol(predCol)
+          .setMetricName("rmse")
+        val metric = eval.evaluate(scoredResult)
+        addBenchmark(s"LightGBMRegressor_${fileName}_${boostingType}", metric, decimals, false)
+      }
     }
   }
 
